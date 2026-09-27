@@ -1,4 +1,10 @@
 """Analyse des trades enregistrés en base SQLite."""
+import os
+from dotenv import load_dotenv
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(script_dir, "config.env"))
+
 import database as db
 
 db.init_db()

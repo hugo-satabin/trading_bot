@@ -5,7 +5,13 @@ Survie aux redémarrages. Thread-safe via timeout et contextmanager.
 import sqlite3, json, os
 from contextlib import contextmanager
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trading_bot.db")
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_configured_db_path = os.getenv("TRADING_DB_PATH", "trading_bot.db")
+DB_PATH = (
+    _configured_db_path
+    if os.path.isabs(_configured_db_path)
+    else os.path.join(_script_dir, _configured_db_path)
+)
 
 
 @contextmanager
@@ -52,6 +58,35 @@ def save_trade(trade: dict):
                 trade.get("reason", ""), trade.get("time"),
             ),
         )
+
+
+def settle_order(order_id: str, values: dict, trade: dict | None = None) -> bool:
+    """Atomically persist a filled exchange order and its resulting bot state."""
+    with _conn() as c:
+        c.execute(
+            "CREATE TABLE IF NOT EXISTS settled_orders (order_id TEXT PRIMARY KEY)"
+        )
+        result = c.execute(
+            "INSERT OR IGNORE INTO settled_orders(order_id) VALUES(?)", (order_id,)
+        )
+        if result.rowcount == 0:
+            return False
+        c.executemany(
+            "INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)",
+            [(key, json.dumps(value)) for key, value in values.items()],
+        )
+        if trade is not None:
+            c.execute(
+                "INSERT INTO trades(side,symbol,price,quantity,pnl,score,reason,time) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    trade.get("side"), trade.get("symbol"),
+                    trade.get("price"), trade.get("quantity"),
+                    trade.get("pnl", 0.0), trade.get("score", 0),
+                    trade.get("reason", ""), trade.get("time"),
+                ),
+            )
+    return True
 
 
 def kv_set(key: str, value):

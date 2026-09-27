@@ -9,8 +9,10 @@ load_dotenv(os.path.join(script_dir, "config.env"))
 symbols = [s.strip() for s in os.getenv("SYMBOLS", "SOL/EUR").split(",")]
 btc_symbol = os.getenv("BTC_SYMBOL", "BTC/EUR")
 checks = {
-    "TELEGRAM_TOKEN": os.getenv("TELEGRAM_TOKEN"),
-    "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID"),
+    "TELEGRAM_TOKEN": os.getenv("TELEGRAM_TOKEN", "").strip(),
+    "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+    "KRAKEN_API_KEY": os.getenv("KRAKEN_API_KEY", "").strip(),
+    "KRAKEN_API_SECRET": os.getenv("KRAKEN_API_SECRET", "").strip(),
     "SYMBOLS": ",".join(symbols),
     "INITIAL_BALANCE": os.getenv("INITIAL_BALANCE"),
 }
@@ -32,8 +34,27 @@ try:
         ticker = exchange.fetch_ticker(symbol)
         print(f"  [OK] {symbol}: {ticker.get('last') or ticker.get('close')}")
 except Exception as exc:
-    print(f"  [ERREUR] Données Kraken: {exc}")
+    print(f"  [ERREUR] Marchés publics Kraken: {exc}")
     all_ok = False
+
+if checks["KRAKEN_API_KEY"] and checks["KRAKEN_API_SECRET"]:
+    try:
+        private_exchange = ccxt.kraken({
+            "apiKey": checks["KRAKEN_API_KEY"],
+            "secret": checks["KRAKEN_API_SECRET"],
+            "enableRateLimit": True,
+        })
+        balance = private_exchange.fetch_balance()
+        free_quote = float((balance.get("free") or {}).get(
+            os.getenv("QUOTE_CURRENCY", "EUR"), 0.0
+        ))
+        private_exchange.fetch_open_orders()
+        print(f"  [OK] Lecture du solde et des ordres ouverts: {free_quote:.2f} {os.getenv('QUOTE_CURRENCY', 'EUR')}")
+    except Exception as exc:
+        print(f"  [ERREUR] Authentification Kraken ou permission de lecture: {exc}")
+        all_ok = False
+else:
+    print("  [À FAIRE] Renseigner les deux clés Kraken pour tester l'authentification")
 
 print()
 print("=== Test modules ===")
@@ -68,6 +89,6 @@ except Exception as e:
 
 print()
 if all_ok:
-    print("=== Vérifications réussies — simulation papier : python main.py ===")
+    print("=== Vérifications réussies. main.py enverra des ordres Spot réels. ===")
 else:
     print("=== PROBLÈMES DÉTECTÉS — corriger avant de lancer ===")

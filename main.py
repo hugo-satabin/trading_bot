@@ -1,5 +1,5 @@
 """
-main.py — Bot de trading Kraken Spot en simulation locale. v3.0
+main.py — Bot de trading Kraken Spot réel. v3.0
 
 Nouveautés v3 :
     • Kraken public API     : cours et chandeliers en EUR, polling
@@ -23,9 +23,12 @@ from datetime import datetime, timedelta
 script_dir = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(script_dir, "config.env"))
 
-for _var in ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"):
-    if not os.getenv(_var):
+for _var in ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID",
+             "KRAKEN_API_KEY", "KRAKEN_API_SECRET"):
+    _value = os.getenv(_var, "").strip()
+    if not _value:
         raise ValueError(f"{_var} manquant dans config.env")
+    os.environ[_var] = _value
 
 import database as db
 from telegram_bot import (notify_trade, update_balance, add_trade,
@@ -34,7 +37,7 @@ from strategies import calculate_score
 from dashboard import start_dashboard, set_positions_ref, set_session_ref
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-FEES_PCT              = float(os.getenv("FEES_PCT",               0.00075))
+FEES_PCT              = float(os.getenv("FEES_PCT",               0.0026))
 TRADE_SIZE_MIN        = float(os.getenv("TRADE_SIZE_MIN",         0.05))
 TRADE_SIZE_MAX        = float(os.getenv("TRADE_SIZE_MAX",         0.12))
 MAX_POSITIONS         = int(os.getenv("MAX_POSITIONS",             6))
@@ -90,7 +93,12 @@ _btc_cache = {"bearish": False, "ts": 0.0}          # cache 5 min (plus réactif
 _BTC_CACHE_TTL  = 300
 _SL_COOLDOWN_S  = 900   # 15 min de pause après un stop-loss
 
-exchange = ccxt.kraken({"enableRateLimit": True})
+exchange = ccxt.kraken({
+    "apiKey": os.environ["KRAKEN_API_KEY"].strip(),
+    "secret": os.environ["KRAKEN_API_SECRET"].strip(),
+    "enableRateLimit": True,
+})
+trading_halted = False
 
 # ─── ANTI-VEILLE WINDOWS ─────────────────────────────────────────────────────
 def _prevent_sleep():
@@ -201,8 +209,10 @@ def _load_symbol_filters(symbol: str):
         return
     limits = market.get("limits") or {}
     min_notional = (limits.get("cost") or {}).get("min")
+    min_amount = (limits.get("amount") or {}).get("min")
     _symbol_filters[symbol] = {
         "min_notional": float(min_notional or 5.0),
+        "min_amount": float(min_amount or 0.0),
     }
 
 def get_price(symbol: str) -> float | None:
@@ -222,13 +232,17 @@ def get_klines(interval: str, limit: int, symbol: str) -> pd.DataFrame:
 # ─── RÉINVESTISSEMENT COMPOSÉ ─────────────────────────────────────────────────
 def save_positions():
     """Sérialise current_positions en DB pour survie aux redémarrages."""
+    db.kv_set("open_positions", _serialize_positions(current_positions))
+
+
+def _serialize_positions(positions: list) -> list:
     serializable = []
-    for p in current_positions:
+    for p in positions:
         p_copy = dict(p)
         if isinstance(p_copy.get("time"), datetime):
             p_copy["time"] = p_copy["time"].isoformat()
         serializable.append(p_copy)
-    db.kv_set("open_positions", serializable)
+    return serializable
 
 
 def load_positions() -> list:
@@ -241,6 +255,50 @@ def load_positions() -> list:
             except Exception:
                 p["time"] = datetime.now()
     return saved
+
+
+def save_pending_orders():
+    db.kv_set("pending_orders", _serialize_pending_orders(pending_orders))
+
+
+def _serialize_pending_orders(orders: dict) -> dict:
+    serialized = {}
+    for order_id, info in orders.items():
+        item = dict(info)
+        if isinstance(item.get("placed_at"), datetime):
+            item["placed_at"] = item["placed_at"].isoformat()
+        serialized[str(order_id)] = item
+    return serialized
+
+
+def load_pending_orders() -> dict:
+    saved = db.kv_get("pending_orders", {})
+    for info in saved.values():
+        if isinstance(info.get("placed_at"), str):
+            info["placed_at"] = datetime.fromisoformat(info["placed_at"])
+    return saved
+
+
+def _order_fee_quote(order: dict, average: float, filled: float) -> float:
+    market = exchange.market(order["symbol"])
+    quote = market["quote"]
+    base = market["base"]
+    fees = order.get("fees") or ([order["fee"]] if order.get("fee") else [])
+    fee_quote = 0.0
+    found_fee = False
+    for fee in fees:
+        if fee.get("cost") is None:
+            continue
+        fee_cost = float(fee["cost"])
+        currency = fee.get("currency")
+        if currency == quote:
+            fee_quote += fee_cost
+        elif currency == base:
+            fee_quote += fee_cost * average
+        else:
+            fee_quote += fee_cost
+        found_fee = True
+    return fee_quote if found_fee else filled * average * FEES_PCT
 
 
 def _update_compound():
@@ -402,9 +460,14 @@ def get_total_positions() -> int:
 # ─── ORDRES LIMITES ───────────────────────────────────────────────────────────
 def place_limit_buy(symbol: str, qty: float, limit_price: float,
                     score: float, levels: dict, regime: str) -> bool:
-    global current_balance
+    global current_balance, trading_halted
+
+    if trading_halted:
+        return False
 
     _load_symbol_filters(symbol)
+    if symbol not in _symbol_filters:
+        return False
     sf      = _symbol_filters[symbol]
     try:
         price_r = float(exchange.price_to_precision(symbol, limit_price))
@@ -415,33 +478,61 @@ def place_limit_buy(symbol: str, qty: float, limit_price: float,
     cost    = qty * price_r
     fee     = cost * FEES_PCT
     total   = cost + fee
+    if qty < sf["min_amount"]:
+        log(f"[WARNING] Quantité {qty} < min {sf['min_amount']} ({symbol})")
+        return False
 
-    if total > current_balance:
-        log(f"[WARNING] Solde insuffisant pour {symbol} ({total:.2f} > {current_balance:.2f})")
+    account = api_call(exchange.fetch_balance)
+    if account is None:
+        return False
+    free_quote = float((account.get("free") or {}).get(QUOTE_CURRENCY, 0.0))
+
+    if total > min(current_balance, free_quote):
+        log(f"[WARNING] Solde EUR insuffisant pour {symbol} (ordre {total:.2f}, libre {free_quote:.2f})")
         return False
     if cost < sf["min_notional"]:
         log(f"[WARNING] Notional {cost:.2f} < min {sf['min_notional']} ({symbol})")
         return False
 
-    order_id = time.time_ns()
+    try:
+        order = exchange.create_limit_buy_order(symbol, qty, price_r)
+    except ccxt.NetworkError as e:
+        trading_halted = True
+        log(f"[ERROR] Résultat d'achat inconnu pour {symbol}; trading suspendu, vérifier Kraken: {e}")
+        return False
+    except ccxt.BaseError as e:
+        log(f"[ERROR] Achat Kraken refusé pour {symbol}: {e}")
+        return False
+
+    order_id = order.get("id")
+    if not order_id:
+        trading_halted = True
+        log(f"[ERROR] Kraken n'a pas renvoyé d'identifiant d'ordre pour {symbol}; trading suspendu")
+        return False
+
+    info = {
+        "symbol": symbol, "qty": qty, "price": price_r,
+        "cost": cost, "fee": fee, "total": total,
+        "score": score, "levels": levels, "regime": regime,
+        "placed_at": datetime.now(),
+    }
     with state_lock:
         current_balance -= total
-        pending_orders[order_id] = {
-            "symbol":    symbol, "qty": qty, "price": price_r,
-            "cost": cost, "fee": fee, "total": total,
-            "score": score, "levels": levels, "regime": regime,
-            "placed_at": datetime.now(),
-        }
+        pending_orders[str(order_id)] = info
     db.kv_set("balance", current_balance)
+    save_pending_orders()
     update_balance(current_balance)
 
-    log(f"[BUY] Ordre papier limite | {qty:.4f} {symbol} @ {price_r:.4f} "
+    log(f"[BUY] Ordre Kraken limite #{order_id} | {qty:.6f} {symbol} @ {price_r:.4f} "
         f"| Score={score:.0f} | SL={levels['sl']:.4f} "
         f"TP1={levels['tp1']:.4f} TP2={levels['tp2']:.4f}"
         + (f" TP3={levels['tp3']:.4f}" if levels.get("tp3") else ""))
     return True
 
-def _create_position_from_fill(order_id: int, info: dict, fill_price: float):
+def _create_position_from_fill(order_id: str, info: dict, fill_price: float,
+                               filled_qty: float, actual_cost: float,
+                               actual_fee: float):
+    global current_balance, trading_halted
     lv = info["levels"]
 
     # Recaler SL/TP sur le prix réel de fill.
@@ -459,8 +550,8 @@ def _create_position_from_fill(order_id: int, info: dict, fill_price: float):
     pos = {
         "symbol":        info["symbol"],
         "entry":         fill_price,
-        "qty_total":     info["qty"],
-        "qty_remaining": info["qty"],
+        "qty_total":     filled_qty,
+        "qty_remaining": filled_qty,
         "sl":            adj_sl,
         "tp1":           adj_tp1,
         "tp2":           adj_tp2,
@@ -472,32 +563,50 @@ def _create_position_from_fill(order_id: int, info: dict, fill_price: float):
         "tp3_done":      False,
         "breakeven":     False,
         "trailing_on":   False,
-        "fee_paid":      info["fee"],
+        "fee_paid":      actual_fee,
         "score":         info["score"],
         "regime":        info["regime"],
+        "entry_order_id": str(order_id),
         "time":          datetime.now(),      # pour la sortie temporelle
     }
     t = {
         "side": "BUY", "symbol": info["symbol"], "price": fill_price,
-        "quantity": info["qty"], "pnl": 0.0, "score": info["score"],
+        "quantity": filled_qty, "pnl": 0.0, "score": info["score"],
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "reason": "limit_filled",
+        "reason": "kraken_limit_filled",
     }
+    new_balance = current_balance + info["total"] - actual_cost - actual_fee
+    new_positions = [dict(existing) for existing in current_positions] + [pos]
+    new_pending = {
+        key: value for key, value in pending_orders.items()
+        if str(key) != str(order_id)
+    }
+    committed = db.settle_order(str(order_id), {
+        "balance": new_balance,
+        "open_positions": _serialize_positions(new_positions),
+        "pending_orders": _serialize_pending_orders(new_pending),
+    }, t)
+    if not committed:
+        trading_halted = True
+        log(f"[ERROR] Ordre d'achat {order_id} déjà réglé en base; trading suspendu")
+        return
+
+    current_balance = new_balance
     with state_lock:
         current_positions.append(pos)
         pending_orders.pop(order_id, None)
         trade_history.append(t)
+    update_balance(current_balance)
     add_trade(t)
-    db.save_trade(t)
-    notify_trade("BUY", info["symbol"], fill_price, info["qty"], 0.0,
-                 current_balance + info["total"], current_balance)
-    save_positions()
-    log(f"[BUY] Ordre rempli | {info['qty']:.4f} {info['symbol']} @ {fill_price:.4f} "
+    notify_trade("BUY", info["symbol"], fill_price, filled_qty, 0.0,
+                 current_balance + actual_cost + actual_fee, current_balance)
+    log(f"[BUY] Ordre Kraken rempli | {filled_qty:.6f} {info['symbol']} @ {fill_price:.4f} "
+        f"| frais={actual_fee:.4f} {QUOTE_CURRENCY} "
         f"| SL={adj_sl:.4f} TP1={adj_tp1:.4f} TP2={adj_tp2:.4f} "
         f"| Score={info['score']:.0f} | ×{compound_factor:.2f} compound")
 
 def check_pending_orders():
-    global current_balance
+    global current_balance, trading_halted
     with state_lock:
         ids = list(pending_orders.keys())
 
@@ -509,36 +618,198 @@ def check_pending_orders():
 
         symbol  = info["symbol"]
         elapsed = (datetime.now() - info["placed_at"]).total_seconds()
-        market_price = get_live_price(symbol)
-        if market_price is not None and market_price <= info["price"]:
-            _create_position_from_fill(order_id, info, info["price"])
-        elif elapsed > LIMIT_EXPIRE_S:
+        order = api_call(exchange.fetch_order, order_id, symbol)
+        if order is None:
+            continue
+        status = str(order.get("status", "")).lower()
+        filled = float(order.get("filled") or 0.0)
+        if status == "open" and (filled > 0 or elapsed > LIMIT_EXPIRE_S):
+            try:
+                exchange.cancel_order(order_id, symbol)
+            except ccxt.BaseError as e:
+                log(f"[WARNING] Annulation {order_id} à confirmer sur Kraken: {e}")
+            order = api_call(exchange.fetch_order, order_id, symbol)
+            if order is None:
+                continue
+            status = str(order.get("status", "")).lower()
+
+        if status not in {"closed", "canceled", "cancelled", "expired", "rejected"}:
+            continue
+
+        filled = float(order.get("filled") or 0.0)
+        if filled > 0:
+            average = float(order.get("average") or order.get("price") or info["price"])
+            actual_cost = float(order.get("cost") or (filled * average))
+            actual_fee = _order_fee_quote(order, average, filled)
+            _create_position_from_fill(
+                str(order_id), info, average, filled, actual_cost, actual_fee
+            )
+        else:
+            new_balance = current_balance + info["total"]
+            new_pending = {
+                key: value for key, value in pending_orders.items()
+                if str(key) != str(order_id)
+            }
+            committed = db.settle_order(str(order_id), {
+                "balance": new_balance,
+                "pending_orders": _serialize_pending_orders(new_pending),
+            })
+            if not committed:
+                trading_halted = True
+                log(f"[ERROR] Annulation {order_id} déjà réglée en base; trading suspendu")
+                continue
             with state_lock:
-                current_balance += info["total"]
+                current_balance = new_balance
                 pending_orders.pop(order_id, None)
             db.kv_set("balance", current_balance)
             update_balance(current_balance)
-            log(f"[INFO] Ordre papier {symbol} expiré — {info['total']:.2f} remboursé")
+            log(f"[INFO] Ordre Kraken {order_id} annulé — {info['total']:.2f} {QUOTE_CURRENCY} libérés")
 
 # ─── VENTE ───────────────────────────────────────────────────────────────────
+def _submit_market_sell(pos: dict, qty: float) -> dict | None:
+    global trading_halted
+    symbol = pos["symbol"]
+    market = exchange.market(symbol)
+    base_currency = market["base"]
+    account = api_call(exchange.fetch_balance)
+    if account is None:
+        return None
+    free_base = float((account.get("free") or {}).get(base_currency, 0.0))
+    try:
+        amount = float(exchange.amount_to_precision(symbol, min(qty, free_base)))
+    except ccxt.BaseError as e:
+        log(f"[ERROR] Quantité de vente invalide pour {symbol}: {e}")
+        return None
+    filters = _symbol_filters.get(symbol, {})
+    if amount < filters.get("min_amount", 0.0) or amount <= 0:
+        log(f"[ERROR] Quantité disponible insuffisante pour vendre {symbol} ({amount})")
+        trading_halted = True
+        pos["exit_failed"] = True
+        save_positions()
+        return None
+
+    try:
+        order = exchange.create_market_sell_order(symbol, amount)
+    except ccxt.NetworkError as e:
+        trading_halted = True
+        pos["exit_pending"] = True
+        save_positions()
+        log(f"[ERROR] Résultat de vente inconnu pour {symbol}; trading suspendu, vérifier Kraken: {e}")
+        return None
+    except ccxt.BaseError as e:
+        trading_halted = True
+        pos["exit_failed"] = True
+        save_positions()
+        log(f"[ERROR] Vente Kraken refusée pour {symbol}; trading suspendu: {e}")
+        return None
+
+    order_id = order.get("id")
+    if not order_id:
+        trading_halted = True
+        pos["exit_pending"] = True
+        save_positions()
+        log(f"[ERROR] Vente {symbol} sans identifiant confirmé; trading suspendu")
+        return None
+
+    status = str(order.get("status", "")).lower()
+    filled = float(order.get("filled") or 0.0)
+    if status == "open":
+        try:
+            exchange.cancel_order(order_id, symbol)
+        except ccxt.BaseError as e:
+            log(f"[WARNING] Annulation de vente {order_id} à confirmer sur Kraken: {e}")
+        order = api_call(exchange.fetch_order, order_id, symbol)
+        if order is None:
+            trading_halted = True
+            pos["exit_pending"] = True
+            save_positions()
+            return None
+        status = str(order.get("status", "")).lower()
+        filled = float(order.get("filled") or 0.0)
+
+    if status not in {"closed", "canceled", "cancelled", "expired"}:
+        trading_halted = True
+        pos["exit_pending"] = True
+        save_positions()
+        log(f"[ERROR] État de vente {order_id} non confirmé ({status}); trading suspendu")
+        return None
+    if filled <= 0:
+        trading_halted = True
+        pos["exit_failed"] = True
+        save_positions()
+        log(f"[ERROR] Vente {order_id} sans quantité exécutée; trading suspendu")
+        return None
+    return order
+
+
 def execute_sell(pos: dict, qty: float, reason: str, price: float) -> bool:
     """
     Vend qty unités au prix price (passé depuis manage_positions pour éviter
     le double appel API). Met à jour le circuit breaker et le compound.
     """
-    global current_balance, session_pnl, session_wins, session_losses
+    global current_balance, session_pnl, session_wins, session_losses, trading_halted
 
-    revenue      = qty * price
-    fee          = revenue * FEES_PCT
-    net_revenue  = revenue - fee
-    buy_cost     = qty * pos["entry"]
-    fee_buy_prop = pos["fee_paid"] * (qty / pos["qty_total"])
+    if pos.get("exit_pending") or pos.get("exit_failed"):
+        return False
+    order = _submit_market_sell(pos, qty)
+    if order is None:
+        return False
+    order_id = str(order["id"])
+    filled_qty = float(order.get("filled") or 0.0)
+    average = float(order.get("average") or order.get("price") or price)
+    revenue = float(order.get("cost") or (filled_qty * average))
+    fee = _order_fee_quote(order, average, filled_qty)
+    net_revenue = revenue - fee
+    buy_cost     = filled_qty * pos["entry"]
+    fee_buy_prop = pos["fee_paid"] * (filled_qty / pos["qty_total"])
     pnl_net      = net_revenue - buy_cost - fee_buy_prop
     pnl_pct      = pnl_net / max(buy_cost, 1e-10) * 100
 
+    updated_pos = dict(pos)
+    updated_pos["qty_remaining"] = max(0.0, pos["qty_remaining"] - filled_qty)
+    updated_pos.pop("exit_pending", None)
+    updated_pos.pop("exit_failed", None)
+    new_positions = []
+    found_position = False
+    entry_order_id = pos.get("entry_order_id")
+    for existing in current_positions:
+        same_position = (
+            existing.get("entry_order_id") == entry_order_id
+            and existing.get("symbol") == pos.get("symbol")
+        )
+        if same_position:
+            found_position = True
+            if updated_pos["qty_remaining"] > 1e-10:
+                new_positions.append(updated_pos)
+        else:
+            new_positions.append(dict(existing))
+    if not found_position:
+        trading_halted = True
+        log(f"[ERROR] Position {pos['symbol']} absente de l'état live; trading suspendu")
+        return False
+
+    new_balance = current_balance + net_revenue
+    t = {
+        "side": "SELL", "symbol": pos["symbol"], "price": average,
+        "quantity": filled_qty, "pnl": pnl_net, "score": 0,
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "reason": reason, "order_id": order_id,
+    }
+    if not db.settle_order(order_id, {
+        "balance": new_balance,
+        "open_positions": _serialize_positions(new_positions),
+    }, t):
+        trading_halted = True
+        log(f"[ERROR] Vente {order_id} déjà réglée en base; trading suspendu")
+        return False
+
     with state_lock:
-        current_balance      += net_revenue
-        pos["qty_remaining"] -= qty
+        current_balance = new_balance
+        pos["qty_remaining"] = updated_pos["qty_remaining"]
+        pos.pop("exit_pending", None)
+        pos.pop("exit_failed", None)
+        current_positions[:] = [p for p in current_positions
+                                if p.get("qty_remaining", 0) > 1e-10]
         session_pnl          += pnl_net
         if pnl_net > 0:
             session_wins += 1
@@ -552,7 +823,6 @@ def execute_sell(pos: dict, qty: float, reason: str, price: float) -> bool:
         else:
             _session_ref["gross_loss"] = _session_ref.get("gross_loss", 0.0) + abs(pnl_net)
 
-    db.kv_set("balance", current_balance)
     update_balance(current_balance)
 
     # Réinvestissement composé — nouveau high watermark ?
@@ -572,21 +842,15 @@ def execute_sell(pos: dict, qty: float, reason: str, price: float) -> bool:
            "[SL]"   if "sl" in reason     else
            "[TOUT]" if reason == "timeout" else "[SELL]")
 
-    t = {
-        "side": "SELL", "symbol": pos["symbol"], "price": price,
-        "quantity": qty, "pnl": pnl_net, "score": 0,
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "reason": reason,
-    }
     with state_lock:
         trade_history.append(t)
     add_trade(t)
-    db.save_trade(t)
-    notify_trade("SELL", pos["symbol"], price, qty, pnl_net,
+    notify_trade("SELL", pos["symbol"], average, filled_qty, pnl_net,
                  current_balance - net_revenue, current_balance, reason=reason)
 
     total_t = session_wins + session_losses
     wr      = session_wins / total_t * 100 if total_t > 0 else 0
-    log(f"{tag} {qty:.4f} {pos['symbol']} @ {price:.4f} "
+    log(f"{tag} {filled_qty:.6f} {pos['symbol']} @ {average:.4f} "
         f"| PnL={pnl_net:+.4f} ({pnl_pct:+.2f}%) "
         f"| Compound ×{compound_factor:.2f} | Session PnL={session_pnl:+.2f} "
         f"WR={wr:.0f}% | Raison={reason}")
@@ -652,19 +916,25 @@ def manage_positions():
 
         # ── 3. TP1 : vente 50% + breakeven ─────────────────────────────
         if not pos["tp1_done"] and price >= pos["tp1"]:
-            execute_sell(pos, pos["qty_remaining"] * 0.50, "tp1", price)
-            pos["tp1_done"]  = True
-            pos["sl"]        = pos["entry"] * 1.003
+            old_sl = pos["sl"]
+            pos["tp1_done"] = True
+            pos["sl"] = pos["entry"] * 1.003
             pos["breakeven"] = True
-            log(f"[INFO] Breakeven SL → {pos['sl']:.4f}")
+            if execute_sell(pos, pos["qty_remaining"] * 0.50, "tp1", price):
+                log(f"[INFO] Breakeven SL → {pos['sl']:.4f}")
+            else:
+                pos["tp1_done"] = False
+                pos["sl"] = old_sl
+                pos["breakeven"] = False
 
         # ── 4. TP2 ──────────────────────────────────────────────────────
         elif pos["tp1_done"] and not pos["tp2_done"] and price >= pos["tp2"]:
             if pos.get("tp3"):
                 # Trending_up : vend seulement 50% du restant (=25% total)
                 # Laisse 25% courir vers TP3
-                execute_sell(pos, pos["qty_remaining"] * 0.50, "tp2", price)
                 pos["tp2_done"] = True
+                if not execute_sell(pos, pos["qty_remaining"] * 0.50, "tp2", price):
+                    pos["tp2_done"] = False
             else:
                 # Mode standard : vend tout
                 execute_sell(pos, pos["qty_remaining"], "tp2", price)
@@ -672,8 +942,9 @@ def manage_positions():
         # ── 5. TP3 (trending_up uniquement) ─────────────────────────────
         elif pos["tp1_done"] and pos["tp2_done"] and not pos.get("tp3_done") \
                 and pos.get("tp3") and price >= pos["tp3"]:
-            execute_sell(pos, pos["qty_remaining"], "tp3", price)
             pos["tp3_done"] = True
+            if not execute_sell(pos, pos["qty_remaining"], "tp3", price):
+                pos["tp3_done"] = False
 
     # Nettoyage + persistance
     with state_lock:
@@ -684,6 +955,10 @@ def manage_positions():
 # ─── SIGNAL + ACHAT ──────────────────────────────────────────────────────────
 def process_symbol(symbol: str):
     """Évalue le signal pour un symbole et place un ordre limite si BUY."""
+    if trading_halted:
+        return
+    if any(info.get("symbol") == symbol for info in pending_orders.values()):
+        return
     # Cooldown par symbole
     with state_lock:
         last_buy = cooldowns.get(symbol)
@@ -811,7 +1086,7 @@ def process_symbol(symbol: str):
 # ─── BOUCLES ─────────────────────────────────────────────────────────────────
 def positions_loop():
     """Vérifie SL/TP toutes les POSITIONS_SLEEP secondes (3s par défaut).
-    Utilise les prix websocket si disponibles → latence quasi-nulle."""
+    Interroge Kraken par polling; le processus doit rester disponible."""
     while bot_running:
         try:
             check_pending_orders()
@@ -860,21 +1135,50 @@ if __name__ == "__main__":
         log("[ERROR] Vérifiez les paires Kraken dans config.env")
         raise SystemExit(1)
 
-    # Restaurer le solde et le high watermark depuis la DB
+    account = api_call(exchange.fetch_balance)
+    if account is None:
+        log("[ERROR] Authentification Kraken échouée ou permission de lecture du solde absente")
+        raise SystemExit(1)
+    free_quote = float((account.get("free") or {}).get(QUOTE_CURRENCY, 0.0))
+
+    # La base live est distincte de l'ancien portefeuille papier.
+    saved_positions = load_positions()
+    pending_orders.update(load_pending_orders())
     saved_balance = db.kv_get("balance")
+    saved_initial = db.kv_get("initial_balance")
+    if saved_initial is None:
+        INITIAL_BALANCE = min(INITIAL_BALANCE, free_quote) if free_quote > 0 else INITIAL_BALANCE
+        db.kv_set("initial_balance", INITIAL_BALANCE)
+    else:
+        INITIAL_BALANCE = float(saved_initial)
     if saved_balance is not None:
-        current_balance = saved_balance
-        log(f"[INFO] Solde restauré depuis DB : {current_balance:.2f} {QUOTE_CURRENCY}")
+        current_balance = min(float(saved_balance), free_quote, INITIAL_BALANCE)
+    else:
+        current_balance = min(free_quote, INITIAL_BALANCE)
+    if current_balance <= 0 and not saved_positions and not pending_orders:
+        log(f"[ERROR] Aucun solde libre en {QUOTE_CURRENCY} et aucune position live à gérer")
+        raise SystemExit(1)
+    db.kv_set("balance", current_balance)
     update_balance(current_balance)
 
-    saved_hwm = db.kv_get("high_watermark")
-    if saved_hwm is not None:
-        high_watermark = saved_hwm
+    high_watermark = float(db.kv_get("high_watermark", INITIAL_BALANCE))
+    db.kv_set("high_watermark", high_watermark)
 
-    saved_positions = load_positions()
     if saved_positions:
         current_positions.extend(saved_positions)
         log(f"[INFO] {len(saved_positions)} position(s) restaurée(s) depuis DB")
+
+    open_orders = api_call(exchange.fetch_open_orders)
+    if open_orders is None:
+        log("[ERROR] Impossible de vérifier les ordres ouverts Kraken; démarrage refusé")
+        raise SystemExit(1)
+    known_order_ids = {str(order_id) for order_id in pending_orders}
+    unknown_orders = [order for order in open_orders
+                      if str(order.get("id")) not in known_order_ids]
+    if unknown_orders:
+        ids = ", ".join(str(order.get("id")) for order in unknown_orders)
+        log(f"[ERROR] Ordres Kraken non suivis ({ids}); démarrage refusé, ne pas les annuler automatiquement")
+        raise SystemExit(1)
 
     compound_factor = current_balance / INITIAL_BALANCE
 
@@ -888,11 +1192,14 @@ if __name__ == "__main__":
         f"| Trailing {TRAILING_DISTANCE*100:.1f}%")
     log(f"[INFO] Stagnation exit {STAGNATION_EXIT_H:.0f}h "
         f"| Circuit breaker {CIRCUIT_BREAKER_N} pertes → {CIRCUIT_BREAKER_H:.0f}h pause")
-    log(f"[INFO] Simulation papier Kraken Spot — aucun ordre réel envoyé")
+    log("[WARNING] MODE RÉEL Kraken Spot — les ordres exécutés utilisent de vrais fonds")
+    log("[WARNING] Les protections SL/TP sont surveillées par ce processus; laissez-le actif")
     log(f"[INFO] Ordres limites -{LIMIT_OFFSET*100:.1f}% "
         f"| Fear&Greed={FEAR_GREED_FILTER} | BTC filter={BTC_FILTER} "
         f"| Kelly={KELLY_CRITERION}")
     log(f"[INFO] Dashboard → http://localhost:{DASHBOARD_PORT}")
+
+    check_pending_orders()
 
     threading.Thread(target=start_price_websocket,        daemon=True).start()
     threading.Thread(target=start_telegram_bot,           daemon=True).start()

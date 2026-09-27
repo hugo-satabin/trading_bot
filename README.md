@@ -3,8 +3,7 @@
 ## Installation
 
 Create a fresh virtual environment for your operating system, then install
-only the application's direct dependencies. The new name preserves the old
-`.venv` directory until you have verified the replacement:
+only the application's direct dependencies:
 
 ```bash
 python -m venv .venv-kraken
@@ -19,8 +18,11 @@ source .venv-kraken/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-Copy `config.env.example` to `config.env`, then set new Telegram credentials.
-The bot uses Kraken's public market data and does not need exchange API keys.
+Set `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, `KRAKEN_API_KEY`, and
+`KRAKEN_API_SECRET` in the local `config.env`. The file is ignored by Git.
+The Kraken API key needs permission to query funds and create/cancel orders;
+do not grant withdrawal permission. Never paste secrets into source files or
+chat messages.
 
 ## Run
 
@@ -29,9 +31,15 @@ python check_startup.py
 python main.py
 ```
 
-`main.py` is paper trading only: it simulates limit-order fills locally and
-never sends trading orders to Kraken. Kraken's public OHLC endpoint returns at
-most 720 candles per request, which can limit backtests on shorter intervals.
+`check_startup.py` checks public markets and authenticated balance access; it
+does not place a test order or prove that the key has trading permission.
+`main.py` places real Kraken Spot orders using the EUR pairs in `config.env`.
+`INITIAL_BALANCE` caps the bot's budget, which is also capped by Kraken's free
+EUR balance. Use only funds you can afford to lose. Stop-loss and take-profit thresholds
+are monitored by this process, not guaranteed exchange-side protective orders;
+keep the process and network connection available. Unknown open Kraken orders
+block startup and are never canceled automatically. Live account state is
+stored separately in `trading_bot_live.db`, not in the old paper-trading DB.
 
-`bot/main.py` is a separate legacy Binance implementation that can submit real
-orders. It has not been migrated; do not run it as part of this setup.
+Kraken's public OHLC endpoint returns at most 720 candles per request, which
+can limit backtests on shorter intervals.
