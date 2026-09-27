@@ -2,12 +2,13 @@
 backtest.py — Moteur de backtesting historique.
 
 Usage :
-  python backtest.py --symbol SOLUSDT --interval 15m --days 30
-  python backtest.py --symbol ETHUSDT --days 60 --balance 2000
+    python backtest.py --symbol SOL/EUR --interval 15m --days 30
+    python backtest.py --symbol ETH/EUR --days 60 --balance 2000
 """
 import argparse, os, sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pandas as pd
+import ccxt
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, script_dir)
@@ -15,16 +16,23 @@ sys.path.insert(0, script_dir)
 from dotenv import load_dotenv
 load_dotenv(os.path.join(script_dir, "config.env"))
 
-from binance.client import Client
 from strategies import calculate_score, compute_levels
 
 
-def _fetch(client, symbol: str, interval: str, days: int) -> pd.DataFrame:
-    start = (datetime.utcnow() - timedelta(days=days)).strftime("%d %b %Y %H:%M:%S")
-    raw = client.get_historical_klines(symbol, interval, start)
+def _fetch(exchange, symbol: str, interval: str, days: int) -> pd.DataFrame:
+    timeframe_seconds = exchange.parse_timeframe(interval)
+    requested_rows = max(1, int(days * 86400 / timeframe_seconds))
+    limit = min(requested_rows, 720)
+    if requested_rows > limit:
+        print(f"[BACKTEST] Kraken limite {interval} à {limit} bougies par requête.")
+    since = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
+    raw = exchange.fetch_ohlcv(
+        symbol, timeframe=interval, since=since, limit=limit
+    )
+    if not raw:
+        raise RuntimeError(f"Aucune bougie Kraken reçue pour {symbol} {interval}")
     df = pd.DataFrame(raw, columns=[
         "timestamp", "open", "high", "low", "close", "volume",
-        "close_time", "qv", "trades", "tb", "tq", "ign",
     ])
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
@@ -32,11 +40,11 @@ def _fetch(client, symbol: str, interval: str, days: int) -> pd.DataFrame:
 
 
 def run_backtest(
-    symbol: str = "SOLUSDT",
+    symbol: str = "SOL/EUR",
     interval: str = "15m",
     days: int = 30,
     initial_balance: float = 1000.0,
-    fees_pct: float = 0.00075,
+    fees_pct: float = 0.0026,
     trade_size_pct: float = 0.08,
     trailing_dist: float = 0.012,
     max_positions: int = 4,
@@ -44,22 +52,19 @@ def run_backtest(
     verbose: bool = True,
 ) -> dict:
     """
-    Simule la stratégie sur données historiques Binance.
+    Simule la stratégie sur les données publiques historiques Kraken.
     Retourne un dict avec les métriques clés.
     params : dict optionnel de paramètres (rsi_period, atr_period, etc.)
              transmis directement à calculate_score / compute_levels.
     """
-    client = Client(
-        os.getenv("BINANCE_API_KEY"),
-        os.getenv("BINANCE_API_SECRET"),
-        testnet=True,
-    )
+    exchange = ccxt.kraken({"enableRateLimit": True})
+    exchange.load_markets()
 
     if verbose:
         print(f"[BACKTEST] Téléchargement {symbol} {interval} {days}j...")
 
-    df_full   = _fetch(client, symbol, interval, days)
-    df_1h_full = _fetch(client, symbol, "1h", days)
+    df_full   = _fetch(exchange, symbol, interval, days)
+    df_1h_full = _fetch(exchange, symbol, "1h", days)
 
     if verbose:
         print(f"[BACKTEST] {len(df_full)} bougies 15m — simulation en cours...")
@@ -212,19 +217,20 @@ def run_backtest(
         print(f"\n{sep}")
         print(f"  BACKTEST — {symbol} {interval} {days}j")
         print(sep)
-        print(f"  Capital initial  : {initial_balance:.2f} USDT")
-        print(f"  Capital final    : {balance:.2f} USDT")
+        quote_currency = os.getenv("QUOTE_CURRENCY", "EUR")
+        print(f"  Capital initial  : {initial_balance:.2f} {quote_currency}")
+        print(f"  Capital final    : {balance:.2f} {quote_currency}")
         pnl_sign = "+" if total_pnl >= 0 else ""
-        print(f"  PnL total        : {pnl_sign}{total_pnl:.2f} USDT "
+        print(f"  PnL total        : {pnl_sign}{total_pnl:.2f} {quote_currency} "
               f"({pnl_sign}{total_pnl/initial_balance*100:.1f}%)")
         print(f"  Trades           : {len(trades)} "
               f"({len(wins)}W / {len(losses)}L)")
         print(f"  Win rate         : {win_rate:.1f}%")
         print(f"  Profit factor    : {profit_factor:.2f}")
         if wins:
-            print(f"  Gain moyen       : +{gross_win/len(wins):.2f} USDT")
+            print(f"  Gain moyen       : +{gross_win/len(wins):.2f} {quote_currency}")
         if losses:
-            print(f"  Perte moyenne    : -{gross_loss/len(losses):.2f} USDT")
+            print(f"  Perte moyenne    : -{gross_loss/len(losses):.2f} {quote_currency}")
         print(f"  Max drawdown     : {max_dd*100:.1f}%")
         print(sep + "\n")
 
@@ -241,7 +247,7 @@ def run_backtest(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Backtest du bot de trading")
-    parser.add_argument("--symbol",   default="SOLUSDT")
+    parser.add_argument("--symbol",   default="SOL/EUR")
     parser.add_argument("--interval", default="15m")
     parser.add_argument("--days",     type=int,   default=30)
     parser.add_argument("--balance",  type=float, default=1000.0)

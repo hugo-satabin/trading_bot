@@ -1,0 +1,3 @@
+# Only for the separate, unported Binance bot in bot/main.py.
+# Do not install this for the Kraken paper-trading process.
+python-binance>=1,<2

@@ -1,6 +1,6 @@
 """
 indicators.py — Bibliothèque d'indicateurs techniques.
-Compatibilité : utilise les noms de colonnes Binance (open, high, low, close, volume).
+Compatibilité : utilise les colonnes OHLCV standard (open, high, low, close, volume).
 """
 import pandas as pd
 import numpy as np

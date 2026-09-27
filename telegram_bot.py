@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 script_dir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(script_dir, 'config.env')
 load_dotenv(config_path)
+QUOTE_CURRENCY = os.getenv("QUOTE_CURRENCY", "EUR")
 
 # Variables globales
 current_balance = float(os.getenv("INITIAL_BALANCE", 1000.0))
@@ -45,9 +46,8 @@ async def start(update: Update, context: CallbackContext):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "🚀 Bot Trading SOLUSDT (Stratégie PRO) 🚀\n\n"
+        "🤖 Bot Trading Spot 🚀\n\n"
         "10 indicateurs techniques | Multi-Timeframe | Risk Management\n"
-        "MODE PRODUCTION : Les trades sont réels !\n\n"
         "Utilise les boutons :",
         reply_markup=reply_markup
     )
@@ -59,7 +59,7 @@ async def button_click(update: Update, context: CallbackContext):
 
     if query.data == "balance":
         await query.edit_message_text(
-            f"💰 Solde Actuel : {current_balance:.2f} USDT\n"
+            f"💰 Solde Actuel : {current_balance:.2f} {QUOTE_CURRENCY}\n"
             f"📊 Trades aujourd'hui : {DAILY_TRADE_COUNT}/{MAX_TRADES_PER_DAY}"
         )
     elif query.data == "history":
@@ -74,7 +74,7 @@ async def button_click(update: Update, context: CallbackContext):
                     f"{emoji} {trade['side']} {trade['symbol']} | "
                     f"Prix: {trade['price']:.4f} | "
                     f"Qte: {trade['quantity']:.6f} | "
-                    f"PnL: {pnl_color} {trade['pnl']:.2f} USDT | "
+                    f"PnL: {pnl_color} {trade['pnl']:.2f} {QUOTE_CURRENCY} | "
                     f"Score: {trade['score']} | "
                     f"{trade['time']}\n"
                 )
@@ -90,7 +90,7 @@ async def button_click(update: Update, context: CallbackContext):
                 reason = trade.get("reason", "N/A")
                 message += (
                     f"{emoji} {trade['side']} a {trade['price']:.4f} | "
-                    f"PnL: {pnl_color} {trade.get('pnl', 0):.2f} USDT | "
+                    f"PnL: {pnl_color} {trade.get('pnl', 0):.2f} {QUOTE_CURRENCY} | "
                     f"Score: {trade['score']} | "
                     f"Raison: {reason} | "
                     f"{trade['time']}\n"
@@ -112,10 +112,10 @@ async def button_click(update: Update, context: CallbackContext):
                 f"📉 Statistiques (Stratégie PRO)\n\n"
                 f"🎯 Gagnants: {wins} ({win_rate:.1f}%)\n"
                 f"❌ Perdants: {losses}\n"
-                f"💰 PnL Total: {total_pnl:.2f} USDT\n"
-                f"📊 PnL Moyen: {avg_pnl:.2f} USDT\n"
-                f"📈 Gain Moyen: {avg_win:.2f} USDT\n"
-                f"📉 Perte Moyenne: {avg_loss:.2f} USDT\n"
+                f"💰 PnL Total: {total_pnl:.2f} {QUOTE_CURRENCY}\n"
+                f"📊 PnL Moyen: {avg_pnl:.2f} {QUOTE_CURRENCY}\n"
+                f"📈 Gain Moyen: {avg_win:.2f} {QUOTE_CURRENCY}\n"
+                f"📉 Perte Moyenne: {avg_loss:.2f} {QUOTE_CURRENCY}\n"
                 f"📊 Trades totaux: {len(trade_history)}\n"
                 f"🔄 Trades aujourd'hui: {DAILY_TRADE_COUNT}/{MAX_TRADES_PER_DAY}\n"
                 f"🎯 Ratio Gain/Perte: {rr:.2f} (ideal > 1.5)"
@@ -164,7 +164,7 @@ async def button_click(update: Update, context: CallbackContext):
 
 async def solde(update: Update, context: CallbackContext):
     await update.message.reply_text(
-        f"💰 Solde Actuel : {current_balance:.2f} USDT\n"
+        f"💰 Solde Actuel : {current_balance:.2f} {QUOTE_CURRENCY}\n"
         f"📊 Trades aujourd'hui : {DAILY_TRADE_COUNT}/{MAX_TRADES_PER_DAY}"
     )
 
@@ -175,10 +175,10 @@ def notify_trade(side, symbol, price, quantity, pnl, balance_before, balance_aft
     pnl_sign = "+" if pnl >= 0 else ""
     message = (
         f"{emoji} {side} {symbol}\n"
-        f"Prix: {price:.4f} USDT\n"
+        f"Prix: {price:.4f} {QUOTE_CURRENCY}\n"
         f"Quantite: {quantity:.6f}\n"
-        f"Solde: {balance_before:.2f} -> {balance_after:.2f} USDT\n"
-        f"PnL: {pnl_sign}{pnl:.2f} USDT\n"
+        f"Solde: {balance_before:.2f} -> {balance_after:.2f} {QUOTE_CURRENCY}\n"
+        f"PnL: {pnl_sign}{pnl:.2f} {QUOTE_CURRENCY}\n"
     )
     if stop_loss and take_profit:
         message += f"SL: {stop_loss:.4f} | TP: {take_profit:.4f}\n"

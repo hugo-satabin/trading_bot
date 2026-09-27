@@ -1,8 +1,8 @@
 """
-main.py — Bot de trading Binance Testnet. v3.0
+main.py — Bot de trading Kraken Spot en simulation locale. v3.0
 
 Nouveautés v3 :
-  • Websocket Binance     : prix temps réel (<100ms) avec fallback polling
+    • Kraken public API     : cours et chandeliers en EUR, polling
   • VWAP + OBV           : deux indicateurs supplémentaires dans le score
   • TP3 trending_up      : 25% du trade laissé courir jusqu'à 4×ATR
   • Sortie temporelle     : positions stagnantes (sans TP1) fermées après 4h
@@ -16,16 +16,14 @@ import os, time, threading, requests, ctypes, atexit, math, queue
 import logging
 from logging.handlers import RotatingFileHandler
 import pandas as pd
+import ccxt
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(script_dir, "config.env"))
 
-for _var in ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID",
-             "BINANCE_API_KEY", "BINANCE_API_SECRET"):
+for _var in ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"):
     if not os.getenv(_var):
         raise ValueError(f"{_var} manquant dans config.env")
 
@@ -56,7 +54,9 @@ KELLY_CRITERION       = os.getenv("KELLY_CRITERION",    "true").lower() == "true
 DASHBOARD_PORT        = int(os.getenv("DASHBOARD_PORT", 5000))
 BUY_THRESHOLD         = int(os.getenv("BUY_THRESHOLD",  65))
 
-SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "SOLUSDT").split(",")]
+QUOTE_CURRENCY = os.getenv("QUOTE_CURRENCY", "EUR")
+BTC_SYMBOL = os.getenv("BTC_SYMBOL", f"BTC/{QUOTE_CURRENCY}")
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", f"SOL/{QUOTE_CURRENCY}").split(",")]
 
 # ─── ÉTAT GLOBAL ─────────────────────────────────────────────────────────────
 INITIAL_BALANCE   = float(os.getenv("INITIAL_BALANCE", 1000.0))
@@ -90,22 +90,16 @@ _btc_cache = {"bearish": False, "ts": 0.0}          # cache 5 min (plus réactif
 _BTC_CACHE_TTL  = 300
 _SL_COOLDOWN_S  = 900   # 15 min de pause après un stop-loss
 
-# ── Websocket prix temps réel ─────────────────────────────────────────────────
-_live_prices: dict = {}    # symbol -> float, mis à jour <100ms via websocket
-_twm = None                # ThreadedWebsocketManager
-
-client = Client(
-    os.getenv("BINANCE_API_KEY"),
-    os.getenv("BINANCE_API_SECRET"),
-    testnet=True,
-)
+exchange = ccxt.kraken({"enableRateLimit": True})
 
 # ─── ANTI-VEILLE WINDOWS ─────────────────────────────────────────────────────
 def _prevent_sleep():
-    ctypes.windll.kernel32.SetThreadExecutionState(0x80000003)
+    if os.name == "nt":
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000003)
 
 def _allow_sleep():
-    ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
+    if os.name == "nt":
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
 
 _prevent_sleep()
 atexit.register(_allow_sleep)
@@ -115,7 +109,7 @@ def api_call(fn, *args, max_retries: int = 3, **kwargs):
     for attempt in range(max_retries):
         try:
             return fn(*args, **kwargs)
-        except (BinanceAPIException,
+        except (ccxt.NetworkError, ccxt.ExchangeError,
                 requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout) as e:
             if attempt == max_retries - 1:
@@ -187,86 +181,40 @@ def log(msg: str):
     if any(k in msg for k in _TG_KEYWORDS):
         _tg_queue.put(out)
 
-# ─── WEBSOCKET PRIX TEMPS RÉEL ───────────────────────────────────────────────
+# ─── COURS PUBLICS KRAKEN ────────────────────────────────────────────────────
 def start_price_websocket():
-    """
-    Démarre un flux websocket Binance pour chaque symbole tradé + BTCUSDT.
-    Met à jour _live_prices en temps réel (<100ms).
-    En cas d'échec, le bot bascule automatiquement sur le polling REST 3s.
-    """
-    global _twm
-    try:
-        from binance import ThreadedWebsocketManager
-        _twm = ThreadedWebsocketManager(
-            api_key=os.getenv("BINANCE_API_KEY"),
-            api_secret=os.getenv("BINANCE_API_SECRET"),
-            testnet=True,
-        )
-        _twm.start()
-
-        def _on_tick(msg):
-            if msg.get("e") == "error":
-                return
-            sym = msg.get("s")
-            if sym:
-                _live_prices[sym] = float(msg["c"])
-
-        targets = list(set(SYMBOLS + ["BTCUSDT"]))
-        for sym in targets:
-            _twm.start_symbol_ticker_socket(callback=_on_tick, symbol=sym)
-
-        log(f"[INFO] Websocket démarré — flux temps réel : {', '.join(targets)}")
-    except Exception as e:
-        log(f"[WARNING] Websocket indisponible ({e}) — fallback polling {POSITIONS_SLEEP}s")
+    log(f"[INFO] Cours Kraken interrogés toutes les {POSITIONS_SLEEP}s")
 
 def get_live_price(symbol: str) -> float | None:
-    """Retourne le prix depuis le websocket si disponible, sinon REST."""
-    p = _live_prices.get(symbol)
-    return p if p else get_price(symbol)
+    return get_price(symbol)
 
-# ─── BINANCE REST ─────────────────────────────────────────────────────────────
+# ─── KRAKEN REST ──────────────────────────────────────────────────────────────
 _symbol_filters: dict = {}
 
 def _load_symbol_filters(symbol: str):
     if symbol in _symbol_filters:
         return
-    info = api_call(client.get_symbol_info, symbol)
-    step = tick = min_notional = None
-    if info:
-        for f in info.get("filters", []):
-            if f["filterType"] == "LOT_SIZE":
-                step = float(f["stepSize"])
-            elif f["filterType"] == "PRICE_FILTER":
-                tick = float(f["tickSize"])
-            elif f["filterType"] in ("MIN_NOTIONAL", "NOTIONAL"):
-                min_notional = float(f.get("minNotional", f.get("notional", 10.0)))
+    try:
+        market = exchange.market(symbol)
+    except (ccxt.BaseError, KeyError) as e:
+        log(f"[ERROR] Marché Kraken indisponible pour {symbol}: {e}")
+        return
+    limits = market.get("limits") or {}
+    min_notional = (limits.get("cost") or {}).get("min")
     _symbol_filters[symbol] = {
-        "step": step or 0.001,
-        "tick": tick or 0.001,
-        "min_notional": min_notional or 10.0,
+        "min_notional": float(min_notional or 5.0),
     }
 
-def _round_qty(qty: float, step: float) -> float:
-    prec = max(0, round(-math.log10(step)))
-    return round(math.floor(qty / step) * step, prec)
-
-def _round_price(price: float, tick: float) -> float:
-    prec = max(0, round(-math.log10(tick)))
-    return round(round(price / tick) * tick, prec)
-
 def get_price(symbol: str) -> float | None:
-    r = api_call(client.get_symbol_ticker, symbol=symbol)
-    return float(r["price"]) if r else None
+    ticker = api_call(exchange.fetch_ticker, symbol)
+    price = ticker.get("last") or ticker.get("close") if ticker else None
+    return float(price) if price is not None else None
 
 def get_klines(interval: str, limit: int, symbol: str) -> pd.DataFrame:
-    raw = api_call(client.get_klines, symbol=symbol,
-                   interval=interval, limit=limit)
+    raw = api_call(exchange.fetch_ohlcv, symbol, interval, None, limit)
     if not raw:
         return pd.DataFrame()
-    df = pd.DataFrame(raw, columns=[
-        "timestamp", "open", "high", "low", "close", "volume",
-        "close_time", "qv", "trades", "tb", "tq", "ign",
-    ])
+    df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
     return df
@@ -309,7 +257,7 @@ def _update_compound():
         high_watermark = current_balance
         growth_pct = (current_balance - INITIAL_BALANCE) / INITIAL_BALANCE * 100
         log(f"[PERF] Nouveau sommet de solde ! "
-            f"Capital={current_balance:.2f} USDT "
+            f"Capital={current_balance:.2f} {QUOTE_CURRENCY} "
             f"(+{growth_pct:.1f}% | ×{compound_factor:.2f} depuis le départ)")
         db.kv_set("high_watermark", high_watermark)
 
@@ -359,7 +307,7 @@ def get_fear_greed() -> int:
 def is_btc_bearish() -> bool:
     if time.time() - _btc_cache["ts"] < _BTC_CACHE_TTL:
         return _btc_cache["bearish"]
-    df = get_klines("1h", 30, "BTCUSDT")
+    df = get_klines("1h", 30, BTC_SYMBOL)
     if df.empty or len(df) < 6:
         return False
     ema21   = df["close"].ewm(span=21, adjust=False).mean()
@@ -424,10 +372,15 @@ def compute_qty(score: float, price: float, symbol: str,
                * max(0.0, (score - 60) / 40)
 
     corr_mult = correlation_discount()
-    usdt = base * frac * corr_mult * extra_mult
+    quote_amount = base * frac * corr_mult * extra_mult
     _load_symbol_filters(symbol)
-    step = _symbol_filters[symbol]["step"]
-    return _round_qty(usdt / price, step)
+    if symbol not in _symbol_filters:
+        return 0.0
+    try:
+        return float(exchange.amount_to_precision(symbol, quote_amount / price))
+    except ccxt.BaseError as e:
+        log(f"[ERROR] Quantité invalide pour {symbol}: {e}")
+        return 0.0
 
 # ─── PROTECTION DRAWDOWN ─────────────────────────────────────────────────────
 def is_max_drawdown_hit() -> bool:
@@ -453,7 +406,12 @@ def place_limit_buy(symbol: str, qty: float, limit_price: float,
 
     _load_symbol_filters(symbol)
     sf      = _symbol_filters[symbol]
-    price_r = _round_price(limit_price, sf["tick"])
+    try:
+        price_r = float(exchange.price_to_precision(symbol, limit_price))
+        qty = float(exchange.amount_to_precision(symbol, qty))
+    except ccxt.BaseError as e:
+        log(f"[ERROR] Précision invalide pour {symbol}: {e}")
+        return False
     cost    = qty * price_r
     fee     = cost * FEES_PCT
     total   = cost + fee
@@ -465,12 +423,7 @@ def place_limit_buy(symbol: str, qty: float, limit_price: float,
         log(f"[WARNING] Notional {cost:.2f} < min {sf['min_notional']} ({symbol})")
         return False
 
-    order = api_call(client.order_limit_buy, symbol=symbol,
-                     quantity=str(qty), price=str(price_r))
-    if order is None:
-        return False
-
-    order_id = order["orderId"]
+    order_id = time.time_ns()
     with state_lock:
         current_balance -= total
         pending_orders[order_id] = {
@@ -482,7 +435,7 @@ def place_limit_buy(symbol: str, qty: float, limit_price: float,
     db.kv_set("balance", current_balance)
     update_balance(current_balance)
 
-    log(f"[BUY] Ordre limite | {qty:.4f} {symbol} @ {price_r:.4f} "
+    log(f"[BUY] Ordre papier limite | {qty:.4f} {symbol} @ {price_r:.4f} "
         f"| Score={score:.0f} | SL={levels['sl']:.4f} "
         f"TP1={levels['tp1']:.4f} TP2={levels['tp2']:.4f}"
         + (f" TP3={levels['tp3']:.4f}" if levels.get("tp3") else ""))
@@ -556,32 +509,16 @@ def check_pending_orders():
 
         symbol  = info["symbol"]
         elapsed = (datetime.now() - info["placed_at"]).total_seconds()
-        data    = api_call(client.get_order, symbol=symbol, orderId=order_id)
-        if data is None:
-            continue
-
-        status = data.get("status", "")
-        if status == "FILLED":
-            fill_price = float(data.get("price", info["price"]))
-            _create_position_from_fill(order_id, info, fill_price)
-
-        elif status in ("CANCELED", "REJECTED", "EXPIRED"):
+        market_price = get_live_price(symbol)
+        if market_price is not None and market_price <= info["price"]:
+            _create_position_from_fill(order_id, info, info["price"])
+        elif elapsed > LIMIT_EXPIRE_S:
             with state_lock:
                 current_balance += info["total"]
                 pending_orders.pop(order_id, None)
             db.kv_set("balance", current_balance)
             update_balance(current_balance)
-            log(f"[INFO] Ordre {order_id} {status} — {info['total']:.2f} remboursé")
-
-        elif elapsed > LIMIT_EXPIRE_S:
-            cancel = api_call(client.cancel_order, symbol=symbol, orderId=order_id)
-            if cancel:
-                with state_lock:
-                    current_balance += info["total"]
-                    pending_orders.pop(order_id, None)
-                db.kv_set("balance", current_balance)
-                update_balance(current_balance)
-                log(f"[INFO] Limite {symbol} annulée (timeout {elapsed:.0f}s)")
+            log(f"[INFO] Ordre papier {symbol} expiré — {info['total']:.2f} remboursé")
 
 # ─── VENTE ───────────────────────────────────────────────────────────────────
 def execute_sell(pos: dict, qty: float, reason: str, price: float) -> bool:
@@ -690,7 +627,7 @@ def manage_positions():
 
         # ── 1. Sortie temporelle (stagnation sans TP1) ──────────────────
         elapsed_h = (datetime.now() - pos["time"]).total_seconds() / 3600
-        stag_limit = 6.0 if pos.get("symbol") == "BTCUSDT" else STAGNATION_EXIT_H
+        stag_limit = 6.0 if pos.get("symbol") == BTC_SYMBOL else STAGNATION_EXIT_H
         if not pos["tp1_done"] and elapsed_h >= stag_limit:
             log(f"[INFO] {pos['symbol']} stagnant depuis {elapsed_h:.1f}h — fermeture")
             execute_sell(pos, pos["qty_remaining"], "timeout", price)
@@ -841,7 +778,7 @@ def process_symbol(symbol: str):
 
     # Filtre macro BTC — réduit la taille ×0.5 au lieu de bloquer
     btc_mult = 1.0
-    if BTC_FILTER and symbol != "BTCUSDT" and is_btc_bearish():
+    if BTC_FILTER and symbol != BTC_SYMBOL and is_btc_bearish():
         btc_mult = 0.5
         prev_btc = _last_symbol_log.get(symbol + "_btc")
         if not prev_btc or (datetime.now() - prev_btc).total_seconds() > 300:
@@ -901,20 +838,33 @@ _LOCK_FILE = os.path.join(script_dir, "bot.lock")
 
 if __name__ == "__main__":
     # Lockfile — empêche deux instances simultanées
-    import msvcrt
     _lock_fh = open(_LOCK_FILE, "w")
     try:
-        msvcrt.locking(_lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(_lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(_lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         print("[ERREUR] Une instance du bot tourne déjà (bot.lock). Arrêtez-la d'abord.")
         raise SystemExit(1)
     db.init_db()
 
+    if not api_call(exchange.load_markets):
+        log("[ERROR] Impossible de charger les marchés publics Kraken")
+        raise SystemExit(1)
+    for sym in set(SYMBOLS + [BTC_SYMBOL]):
+        _load_symbol_filters(sym)
+    if any(sym not in _symbol_filters for sym in SYMBOLS + [BTC_SYMBOL]):
+        log("[ERROR] Vérifiez les paires Kraken dans config.env")
+        raise SystemExit(1)
+
     # Restaurer le solde et le high watermark depuis la DB
     saved_balance = db.kv_get("balance")
     if saved_balance is not None:
         current_balance = saved_balance
-        log(f"[INFO] Solde restauré depuis DB : {current_balance:.2f} USDT")
+        log(f"[INFO] Solde restauré depuis DB : {current_balance:.2f} {QUOTE_CURRENCY}")
     update_balance(current_balance)
 
     saved_hwm = db.kv_get("high_watermark")
@@ -928,19 +878,17 @@ if __name__ == "__main__":
 
     compound_factor = current_balance / INITIAL_BALANCE
 
-    for sym in SYMBOLS:
-        _load_symbol_filters(sym)
-
     _session_ref["start_balance"] = current_balance
     set_positions_ref(current_positions, INITIAL_BALANCE)
     set_session_ref(_session_ref)
 
     log(f"[INFO] Bot v3 démarré | Symboles={','.join(SYMBOLS)} "
-        f"| Capital={current_balance:.2f} USDT (×{compound_factor:.2f})")
+        f"| Capital={current_balance:.2f} {QUOTE_CURRENCY} (×{compound_factor:.2f})")
     log(f"[INFO] TP1=50% TP2=50%(trending)/100% TP3=trending_up seulement "
         f"| Trailing {TRAILING_DISTANCE*100:.1f}%")
     log(f"[INFO] Stagnation exit {STAGNATION_EXIT_H:.0f}h "
         f"| Circuit breaker {CIRCUIT_BREAKER_N} pertes → {CIRCUIT_BREAKER_H:.0f}h pause")
+    log(f"[INFO] Simulation papier Kraken Spot — aucun ordre réel envoyé")
     log(f"[INFO] Ordres limites -{LIMIT_OFFSET*100:.1f}% "
         f"| Fear&Greed={FEAR_GREED_FILTER} | BTC filter={BTC_FILTER} "
         f"| Kelly={KELLY_CRITERION}")

@@ -54,11 +54,11 @@ _HTML = """<!DOCTYPE html>
       const pb = data.balance>=data.initial?'green':'red';
       document.getElementById('summary').innerHTML = `
         <div class="card"><div class="label">Solde</div>
-          <div class="value ${pb}">${fmt(data.balance,2)} USDT</div></div>
+          <div class="value ${pb}">${fmt(data.balance,2)} EUR</div></div>
         <div class="card"><div class="label">PnL réalisé (session)</div>
-          <div class="value ${pnlClass(data.session_pnl)}">${pnlSign(data.session_pnl)}${fmt(data.session_pnl,2)} USDT</div></div>
+          <div class="value ${pnlClass(data.session_pnl)}">${pnlSign(data.session_pnl)}${fmt(data.session_pnl,2)} EUR</div></div>
         <div class="card"><div class="label">PnL portefeuille</div>
-          <div class="value ${pnlClass(data.balance_pnl)}">${pnlSign(data.balance_pnl)}${fmt(data.balance_pnl,2)} USDT</div></div>
+          <div class="value ${pnlClass(data.balance_pnl)}">${pnlSign(data.balance_pnl)}${fmt(data.balance_pnl,2)} EUR</div></div>
         <div class="card"><div class="label">Win Rate</div>
           <div class="value">${fmt(data.win_rate,1)}%</div></div>
         <div class="card"><div class="label">Trades (W/L)</div>

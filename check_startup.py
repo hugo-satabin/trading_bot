@@ -1,39 +1,38 @@
-"""Script de vérification avant lancement du bot."""
-from dotenv import load_dotenv
+"""Vérifie la configuration et les données publiques Kraken avant lancement."""
 import os
-load_dotenv("config.env")
+from dotenv import load_dotenv
+import ccxt
 
-print("=== Vérification config ===")
+script_dir = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(script_dir, "config.env"))
+
+symbols = [s.strip() for s in os.getenv("SYMBOLS", "SOL/EUR").split(",")]
+btc_symbol = os.getenv("BTC_SYMBOL", "BTC/EUR")
 checks = {
-    "BINANCE_API_KEY":    os.getenv("BINANCE_API_KEY"),
-    "BINANCE_API_SECRET": os.getenv("BINANCE_API_SECRET"),
-    "TELEGRAM_TOKEN":     os.getenv("TELEGRAM_TOKEN"),
-    "TELEGRAM_CHAT_ID":   os.getenv("TELEGRAM_CHAT_ID"),
-    "SYMBOLS":            os.getenv("SYMBOLS"),
-    "INITIAL_BALANCE":    os.getenv("INITIAL_BALANCE"),
+    "TELEGRAM_TOKEN": os.getenv("TELEGRAM_TOKEN"),
+    "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID"),
+    "SYMBOLS": ",".join(symbols),
+    "INITIAL_BALANCE": os.getenv("INITIAL_BALANCE"),
 }
 all_ok = True
-for k, v in checks.items():
-    status = "[OK]" if v else "[MANQUANT]"
-    if not v:
+print("=== Vérification config ===")
+for name, value in checks.items():
+    status = "[OK]" if value else "[MANQUANT]"
+    if not value:
         all_ok = False
-    display = (v[:14] + "...") if v and len(v) > 14 else v
-    print(f"  {status} {k} = {display}")
+    print(f"  {status} {name}")
 
-print()
-print("=== Test connexion Binance testnet ===")
-from binance.client import Client
+print("\n=== Test des marchés publics Kraken ===")
 try:
-    c = Client(os.getenv("BINANCE_API_KEY"), os.getenv("BINANCE_API_SECRET"), testnet=True)
-    info = c.get_account()
-    balances = [b for b in info["balances"] if float(b["free"]) > 0]
-    print("  [OK] Connexion testnet etablie")
-    print("  Soldes disponibles :")
-    for b in balances[:8]:
-        print(f"    {b['asset']:6s} : {b['free']}")
-except Exception as e:
-    print(f"  [ERREUR] Connexion Binance : {e}")
-    print("  --> Regenerer les cles sur https://testnet.binance.vision")
+    exchange = ccxt.kraken({"enableRateLimit": True})
+    markets = exchange.load_markets()
+    for symbol in list(dict.fromkeys(symbols + [btc_symbol])):
+        if symbol not in markets:
+            raise ValueError(f"Paire indisponible: {symbol}")
+        ticker = exchange.fetch_ticker(symbol)
+        print(f"  [OK] {symbol}: {ticker.get('last') or ticker.get('close')}")
+except Exception as exc:
+    print(f"  [ERREUR] Données Kraken: {exc}")
     all_ok = False
 
 print()
@@ -69,6 +68,6 @@ except Exception as e:
 
 print()
 if all_ok:
-    print("=== TOUT EST OK — tu peux lancer : python main.py ===")
+    print("=== Vérifications réussies — simulation papier : python main.py ===")
 else:
-    print("=== PROBLEMES DETECTES — corriger avant de lancer ===")
+    print("=== PROBLÈMES DÉTECTÉS — corriger avant de lancer ===")

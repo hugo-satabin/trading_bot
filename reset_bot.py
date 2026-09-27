@@ -16,6 +16,6 @@ else:
         c.execute("INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)", ("balance",      json.dumps(INITIAL_BALANCE)))
         c.execute("INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)", ("high_watermark", json.dumps(INITIAL_BALANCE)))
         c.commit()
-    print(f"[OK] Base effacee. Balance et high_watermark remis a {INITIAL_BALANCE} USDT.")
+    print(f"[OK] Base effacee. Balance et high_watermark remis a {INITIAL_BALANCE} EUR.")
 
 print("[OK] Reset termine. Tu peux relancer main.py.")

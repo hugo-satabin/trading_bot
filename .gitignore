@@ -1,0 +1,8 @@
+.venv/
+.venv-*/
+config.env
+__pycache__/
+*.py[cod]
+*.db
+*.log
+bot.lock

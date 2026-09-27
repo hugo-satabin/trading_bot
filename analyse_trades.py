@@ -29,10 +29,10 @@ else:
     print(f"  Ventes       : {len(sells)}")
     print(f"  Wins / Losses: {len(wins)} W / {len(losses)} L")
     print(f"  Win rate     : {win_rate:.1f}%")
-    print(f"  PnL total    : {total_pnl:+.4f} USDT")
+    print(f"  PnL total    : {total_pnl:+.4f} EUR")
     print(f"  Profit factor: {pf:.2f}")
-    print(f"  Gain moyen   : {avg_win:+.4f} USDT")
-    print(f"  Perte moyenne: {avg_loss:+.4f} USDT")
+    print(f"  Gain moyen   : {avg_win:+.4f} EUR")
+    print(f"  Perte moyenne: {avg_loss:+.4f} EUR")
     print(f"  Ratio G/P    : {abs(avg_win/avg_loss):.2f}" if avg_loss else "  Ratio G/P    : inf")
 
     print()

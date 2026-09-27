@@ -352,7 +352,7 @@ def compute_levels(
 def calculate_score(
     df: pd.DataFrame,
     df_1h: pd.DataFrame = None,
-    symbol: str = "SOLUSDT",
+    symbol: str = "SOL/EUR",
     params: dict = None,
     quiet: bool = False,
 ) -> dict:

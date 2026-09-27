@@ -2,8 +2,8 @@
 optimize.py — Optimisation Optuna des hyperparamètres du bot.
 
 Usage :
-  python optimize.py                            # 50 trials, SOLUSDT, 30j
-  python optimize.py --symbol ETHUSDT --trials 100 --days 60
+    python optimize.py                            # 50 trials, SOL/EUR, 30j
+    python optimize.py --symbol ETH/EUR --trials 100 --days 60
   python optimize.py --show                     # afficher le meilleur résultat existant
 
 L'étude est persistée dans optuna_study.db — relancer ajoute des trials.
@@ -60,7 +60,7 @@ def objective(trial: optuna.Trial, symbol: str, days: int) -> float:
         return -9999.0
 
 
-def run_optimization(symbol: str = "SOLUSDT", days: int = 30,
+def run_optimization(symbol: str = "SOL/EUR", days: int = 30,
                      n_trials: int = 50) -> dict:
     print(f"[OPTUNA] Optimisation {symbol} {days}j — {n_trials} trials")
     print(f"[OPTUNA] Étude persistée dans : {STUDY_DB}")
@@ -110,7 +110,7 @@ def _print_results(study: optuna.Study):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Optimisation Optuna du bot")
-    parser.add_argument("--symbol", default="SOLUSDT")
+    parser.add_argument("--symbol", default="SOL/EUR")
     parser.add_argument("--days",   type=int, default=30)
     parser.add_argument("--trials", type=int, default=50)
     parser.add_argument("--show",   action="store_true",
